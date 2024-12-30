@@ -1,3 +1,7 @@
 {
-  "C_Cpp.intelliSenseEngine": "default"
+  "C_Cpp.intelliSenseEngine": "default",
+  "files.associations": {
+    "cjson.h": "c",
+    "freertos.h": "c"
+  }
 }
