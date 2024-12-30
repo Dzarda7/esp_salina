@@ -38,10 +38,10 @@ static void https_native_request(void)
     esp_http_client_config_t config = {
         .host = "www.idsjmk.cz",
         .path = "/api/departures/busstop-by-name?busStopName=Kartouzsk%C3%A1",
-        // .use_global_ca_store = true,
         .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        // .event_handler = _http_event_handler,
+        // Certificate is not provided, so server verification will be disabled which enables MITM attack!
+        // This should not be a problem, because data is not sensitive and very important.
+        // Reason is to avoid need of certificate update in case of expiration.
     };
     esp_http_client_handle_t client = esp_http_client_init(&config);
 
@@ -70,15 +70,7 @@ static void https_native_request(void)
     esp_http_client_cleanup(client);
 }
 
-static void http_test_task(void *pvParameters)
-{
-    https_native_request();
-
-    ESP_LOGI(TAG, "Finish http example");
-    vTaskDelete(NULL);
-}
-
-void app_main(void)
+static void get_data_task(void *pvParameters)
 {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
@@ -97,5 +89,13 @@ void app_main(void)
     ESP_ERROR_CHECK(example_connect());
     ESP_LOGI(TAG, "Connected to AP, begin http example");
 
-    xTaskCreate(&http_test_task, "http_test_task", 8192, NULL, 5, NULL);
+    https_native_request();
+
+    ESP_LOGI(TAG, "Finish http example");
+    vTaskDelete(NULL);
+}
+
+void app_main(void)
+{
+    xTaskCreate(&get_data_task, "get_data_task", 8192, NULL, 5, NULL);
 }
