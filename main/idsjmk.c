@@ -266,36 +266,17 @@ esp_err_t salina_fetch_departures(const salina_config_t *cfg, salina_data_t *out
     return ret;
 }
 
-esp_err_t salina_lookup_stop(const char *query, salina_stop_info_t *out)
+/** @brief Pull the stop, its town-qualified name and its platforms out of a reply. */
+static esp_err_t parse_stop_info(const char *json, const char *query, salina_stop_info_t *out)
 {
-    ESP_RETURN_ON_FALSE(query && out, ESP_ERR_INVALID_ARG, TAG, "null argument");
-    memset(out, 0, sizeof(*out));
-
-    char encoded[128];
-    url_encode(query, encoded, sizeof(encoded));
-
-    char path[sizeof(API_PATH) + sizeof(encoded)];
-    snprintf(path, sizeof(path), "%s%s", API_PATH, encoded);
-
-    response_t resp = { .buf = malloc(RESPONSE_LIMIT), .len = 0 };
-    ESP_RETURN_ON_FALSE(resp.buf, ESP_ERR_NO_MEM, TAG, "no mem for response");
-    resp.buf[0] = '\0';
-
-    esp_err_t ret = api_request(path, NULL, &resp);
-    if (ret != ESP_OK) {
-        free(resp.buf);
-        return ret;
-    }
-
-    cJSON *root = cJSON_Parse(resp.buf);
-    free(resp.buf);
+    cJSON *root = cJSON_Parse(json);
     ESP_RETURN_ON_FALSE(root, ESP_ERR_INVALID_RESPONSE, TAG, "malformed JSON");
 
+    esp_err_t ret = ESP_ERR_NOT_FOUND;
     const cJSON *stops = cJSON_GetObjectItemCaseSensitive(root, "stops");
     const cJSON *entry = cJSON_GetArrayItem(stops, 0);
     if (!entry) {
-        cJSON_Delete(root);
-        return ESP_ERR_NOT_FOUND;
+        goto out_free;
     }
 
     const cJSON *stop = cJSON_GetObjectItemCaseSensitive(entry, "stop");
@@ -320,7 +301,52 @@ esp_err_t salina_lookup_stop(const char *query, salina_stop_info_t *out)
         slot->number = number->valueint;
         strlcpy(slot->description, cJSON_IsString(desc) ? desc->valuestring : "", sizeof(slot->description));
     }
+    ret = ESP_OK;
 
+out_free:
     cJSON_Delete(root);
-    return ESP_OK;
+    return ret;
+}
+
+esp_err_t salina_lookup_stop(const char *query, salina_stop_info_t *out)
+{
+    ESP_RETURN_ON_FALSE(query && out, ESP_ERR_INVALID_ARG, TAG, "null argument");
+
+    char encoded[128];
+    url_encode(query, encoded, sizeof(encoded));
+
+    char path[sizeof(API_PATH) + sizeof(encoded)];
+    snprintf(path, sizeof(path), "%s%s", API_PATH, encoded);
+
+    response_t resp = { .buf = malloc(RESPONSE_LIMIT), .len = 0 };
+    ESP_RETURN_ON_FALSE(resp.buf, ESP_ERR_NO_MEM, TAG, "no mem for response");
+
+    /* The same intermittently empty answer the departure fetch retries around
+     * also lands here, and during setup it is worse: it reads as "this stop has
+     * no platforms", which is indistinguishable from a stop that really has
+     * none. Retry before believing it. */
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= CONFIG_SALINA_FETCH_ATTEMPTS; attempt++) {
+        memset(out, 0, sizeof(*out));
+        resp.len = 0;
+        resp.buf[0] = '\0';
+
+        ret = api_request(path, NULL, &resp);
+        if (ret == ESP_OK) {
+            ret = parse_stop_info(resp.buf, query, out);
+        }
+        if ((ret == ESP_OK && out->sign_count > 0) || attempt == CONFIG_SALINA_FETCH_ATTEMPTS) {
+            break;
+        }
+
+        ESP_LOGW(TAG,
+                 "attempt %d/%d gave no platforms, retrying in %d s",
+                 attempt,
+                 CONFIG_SALINA_FETCH_ATTEMPTS,
+                 CONFIG_SALINA_FETCH_RETRY_DELAY_S);
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_SALINA_FETCH_RETRY_DELAY_S * 1000));
+    }
+
+    free(resp.buf);
+    return ret;
 }
