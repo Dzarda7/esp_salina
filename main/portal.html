@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>esp_salina setup</title>
+<style>
+body{font-family:system-ui,sans-serif;margin:0;padding:20px;max-width:30rem;background:#fafafa;color:#111}
+h1{font-size:1.3rem;margin:0 0 1rem}
+h2{font-size:1rem;margin:1.5rem 0 .5rem;color:#555}
+label{display:block;margin:.6rem 0 .2rem;font-size:.9rem}
+input,select,button{width:100%;padding:.6rem;font-size:1rem;border:1px solid #ccc;border-radius:6px;box-sizing:border-box}
+button{background:#1565c0;color:#fff;border:0;margin-top:1rem;font-weight:600}
+button:disabled{background:#999}
+.hint{font-size:.8rem;color:#666;margin:.4rem 0 0;line-height:1.4}
+.msg{margin-top:.8rem;padding:.6rem;border-radius:6px;font-size:.9rem}
+.err{background:#fdecea;color:#a12}
+.ok{background:#e8f5e9;color:#1b5e20}
+.sign{display:flex;align-items:center;gap:.5rem;margin:.3rem 0;padding:.5rem;border:1px solid #ddd;border-radius:6px;background:#fff}
+.sign input{width:auto}
+fieldset{border:1px solid #ddd;border-radius:6px;margin:0 0 1rem;padding:.5rem .8rem}
+legend{font-size:.85rem;color:#555}
+#stage2{display:none}
+</style>
+</head>
+<body>
+<h1>esp_salina setup</h1>
+
+<div id="stage1">
+  <h2>1 &middot; Wi-Fi</h2>
+  <label for="ssid">Network</label>
+  <select id="ssid"><option>scanning&hellip;</option></select>
+  <label for="pass">Password</label>
+  <input id="pass" type="password" autocomplete="off">
+  <button id="join">Connect</button>
+  <div id="wifimsg"></div>
+</div>
+
+<div id="stage2">
+  <h2>2 &middot; Stop</h2>
+  <label for="stop">Stop name &mdash; any IDS JMK stop, not just Brno</label>
+  <input id="stop" placeholder="kartouzska, znojmo, blansko&hellip;" autocomplete="off">
+  <p class="hint">Accents and case do not matter and partial names work, so
+  <code>kartouzska</code> finds <code>Kartouzsk&aacute;</code>. Check the town
+  in the result before you save.</p>
+  <button id="find">Find</button>
+  <div id="stopmsg"></div>
+  <form id="picker" style="display:none">
+    <fieldset><legend>Left column</legend><div id="left"></div></fieldset>
+    <fieldset><legend>Right column</legend><div id="right"></div></fieldset>
+    <button id="save" type="submit">Save and restart</button>
+  </form>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const show = (el, text, cls) => { el.className = 'msg ' + cls; el.textContent = text; };
+let found = null;
+
+fetch('/scan').then(r => r.json()).then(nets => {
+  const sel = $('ssid');
+  sel.innerHTML = '';
+  nets.forEach(n => {
+    const o = document.createElement('option');
+    o.value = o.textContent = n.ssid;
+    sel.appendChild(o);
+  });
+  if (!nets.length) { sel.innerHTML = '<option>no networks found</option>'; }
+}).catch(() => show($('wifimsg'), 'Could not scan.', 'err'));
+
+$('join').onclick = async () => {
+  $('join').disabled = true;
+  show($('wifimsg'), 'Connecting… the setup network may drop for a moment.', 'ok');
+  await fetch('/connect', {
+    method: 'POST',
+    body: JSON.stringify({ssid: $('ssid').value, pass: $('pass').value})
+  });
+  for (let i = 0; i < 40; i++) {
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const s = await (await fetch('/status')).json();
+      if (s.state === 'connected') {
+        show($('wifimsg'), 'Connected.', 'ok');
+        $('stage2').style.display = 'block';
+        return;
+      }
+      if (s.state === 'failed') {
+        show($('wifimsg'), 'Could not join that network.', 'err');
+        $('join').disabled = false;
+        return;
+      }
+    } catch (e) { /* the AP hops channel as the board joins; keep polling */ }
+  }
+  show($('wifimsg'), 'Timed out.', 'err');
+  $('join').disabled = false;
+};
+
+$('find').onclick = async () => {
+  const q = $('stop').value.trim();
+  if (!q) { return; }
+  show($('stopmsg'), 'Searching…', 'ok');
+  const r = await fetch('/search?q=' + encodeURIComponent(q));
+  if (!r.ok) { show($('stopmsg'), 'No stop matched.', 'err'); return; }
+  found = await r.json();
+  if (!found.signs.length) {
+    show($('stopmsg'), 'Found "' + found.full + '", but it lists no platforms right now. ' +
+         'The API hides platforms with no upcoming departures, so try again during service hours.', 'err');
+    $('picker').style.display = 'none';
+    return;
+  }
+  show($('stopmsg'), 'Found "' + found.full + '".', 'ok');
+  ['left', 'right'].forEach((side, idx) => {
+    $(side).innerHTML = '';
+    found.signs.forEach((s, i) => {
+      const id = side + s.number;
+      const row = document.createElement('label');
+      row.className = 'sign';
+      row.innerHTML = '<input type="radio" name="' + side + '" value="' + s.number + '"' +
+                      (i === idx ? ' checked' : '') + '><span><b>' + s.number + '</b> ' +
+                      (s.description || '') + '</span>';
+      $(side).appendChild(row);
+    });
+  });
+  $('picker').style.display = 'block';
+};
+
+$('picker').onsubmit = async e => {
+  e.preventDefault();
+  $('save').disabled = true;
+  const pick = side => document.querySelector('input[name=' + side + ']:checked').value;
+  await fetch('/save', {
+    method: 'POST',
+    body: JSON.stringify({stop: found.name, left: +pick('left'), right: +pick('right')})
+  });
+  document.body.innerHTML = '<h1>Saved</h1><p>The board is restarting. ' +
+                            'It will show departures at the next update.</p>';
+};
+</script>
+</body>
+</html>

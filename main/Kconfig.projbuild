@@ -1,0 +1,60 @@
+menu "Salina departure display"
+
+    config SALINA_CONFIG_PIN
+        int "GPIO that re-opens the setup portal, or -1 for none"
+        default -1
+        range -1 39
+        help
+            Held low at boot, this forgets the stored settings and starts the
+            setup portal again. Leave it at -1 if you have not soldered a
+            button. Do not use GPIO0: low at reset puts the ESP32 into ROM
+            download mode, so the board would not boot at all. Avoid 12 and 15
+            (strapping), 6-11 (flash) and 34-39 (no internal pull-up).
+            GPIO13, 14, 25, 26, 27, 32 and 33 are all safe.
+
+    config SALINA_UPDATE_INTERVAL_MIN
+        int "Minutes between updates"
+        default 15
+        range 1 240
+
+    config SALINA_FETCH_ATTEMPTS
+        int "Attempts per wake before giving up on the API"
+        default 3
+        range 1 10
+        help
+            The API intermittently answers with the stop but no platforms.
+            Retrying within the same wake is cheap because Wi-Fi is already
+            up, so a bad answer costs seconds instead of a whole cycle.
+
+    config SALINA_FETCH_RETRY_DELAY_S
+        int "Seconds between attempts"
+        default 3
+        range 1 60
+
+    config SALINA_NIGHT_START_HOUR
+        int "Hour when the night sleep starts"
+        default 22
+        range 0 23
+
+    config SALINA_NIGHT_END_HOUR
+        int "Hour when the night sleep ends"
+        default 6
+        range 0 23
+
+    config SALINA_BATTERY_DIVIDER_X100
+        int "Battery divider ratio x100"
+        default 177
+        help
+            177 matches the ESPink-Shelf divider of 1M over 1.3M: the ADC sees
+            1.3 / 2.3 of the battery voltage. Adjust if the reported voltage
+            does not match a multimeter.
+
+    config SALINA_BATTERY_EMPTY_MV
+        int "Battery voltage treated as empty (mV)"
+        default 3300
+
+    config SALINA_BATTERY_FULL_MV
+        int "Battery voltage treated as full (mV)"
+        default 4200
+
+endmenu

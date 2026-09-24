@@ -1,0 +1,2 @@
+[codespell]
+skip = ./build,./managed_components,./.git,./main/fonts

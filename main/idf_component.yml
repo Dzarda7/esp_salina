@@ -1,0 +1,6 @@
+---
+dependencies:
+  idf: '>=6.0'
+  dzarda7/esp_epaper: ^0.1.0
+  lvgl/lvgl: ^9.3.0
+  espressif/cjson: ^1.7.19
