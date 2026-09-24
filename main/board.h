@@ -34,21 +34,12 @@
 #define BOARD_BATTERY_ADC_UNIT    ADC_UNIT_1
 #define BOARD_BATTERY_ADC_CHANNEL ADC_CHANNEL_6
 
-/** @brief Power hook handed to the e-paper driver. */
-static inline esp_err_t board_panel_power(bool on, void *user_ctx)
-{
-    (void)user_ctx;
-    /* Claim the pin once: gpio_config() on an already configured pin makes the
-     * GPIO driver complain about a conflict. */
-    static bool configured;
-
-    if (!configured) {
-        const gpio_config_t cfg = {
-            .mode = GPIO_MODE_OUTPUT,
-            .pin_bit_mask = 1ULL << BOARD_PIN_POWER,
-        };
-        ESP_RETURN_ON_ERROR(gpio_config(&cfg), "board", "power pin");
-        configured = true;
-    }
-    return gpio_set_level(BOARD_PIN_POWER, on ? 1 : 0);
-}
+/**
+ * @brief Power hook handed to the e-paper driver.
+ *
+ * Lives in board.c rather than here: it claims GPIO 2 on first use, and a
+ * static inline would give every translation unit its own copy of that guard,
+ * so the pin would be configured once per caller and the GPIO driver would
+ * report a conflict.
+ */
+esp_err_t board_panel_power(bool on, void *user_ctx);
