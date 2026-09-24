@@ -148,7 +148,13 @@ void salina_time_set_tz(void)
 
 esp_err_t salina_time_sync(void)
 {
-    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+    /* Three servers rather than one: a single lost packet against a single
+     * server does not retry inside our wait, which shows up as an occasional
+     * unsynced clock. The Czech pool is first because it answers fastest. */
+    esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG_MULTIPLE(3,
+                                                                   ESP_SNTP_SERVER_LIST("cz.pool.ntp.org",
+                                                                                        "pool.ntp.org",
+                                                                                        "time.google.com"));
 
     ESP_RETURN_ON_ERROR(esp_netif_sntp_init(&cfg), TAG, "sntp init");
     const esp_err_t err = esp_netif_sntp_sync_wait(pdMS_TO_TICKS(SNTP_TIMEOUT_MS));
