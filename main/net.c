@@ -85,9 +85,9 @@ esp_err_t salina_net_connect(const char *ssid, const char *password)
 
     wifi_config_t wifi_cfg = {
         .sta = {
-            /* WPA2 as the floor still associates with a WPA3 transition AP,
-             * while refusing to fall back to an open one. */
-            .threshold.authmode = WIFI_AUTH_WPA_WPA2_PSK,
+            /* A minimum, not a filter: the enum is ordered, so anything above
+             * WPA2 here would refuse a plain WPA2-PSK access point. */
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
         },
     };
     strlcpy((char *)wifi_cfg.sta.ssid, ssid, sizeof(wifi_cfg.sta.ssid));
