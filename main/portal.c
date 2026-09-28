@@ -188,6 +188,47 @@ static esp_err_t connect_post(httpd_req_t *req)
     return httpd_resp_sendstr(req, "{}");
 }
 
+static esp_err_t sources_get(httpd_req_t *req)
+{
+    cJSON *list = cJSON_CreateArray();
+
+    for (int i = 0; i < SALINA_SOURCE_COUNT; i++) {
+        const salina_source_t *source = salina_source_get(i);
+        if (!source) {
+            continue;
+        }
+        cJSON *entry = cJSON_CreateObject();
+        cJSON_AddNumberToObject(entry, "id", i);
+        cJSON_AddStringToObject(entry, "name", source->name);
+        cJSON_AddStringToObject(entry, "hint", source->hint ? source->hint : "");
+        cJSON_AddBoolToObject(entry, "needs_key", source->needs_api_key);
+        cJSON_AddStringToObject(entry, "key_hint", source->key_hint ? source->key_hint : "");
+        cJSON_AddItemToArray(list, entry);
+    }
+    return send_json(req, list);
+}
+
+/** @brief The city and its key, kept aside until the stop is picked. */
+static esp_err_t source_post(httpd_req_t *req)
+{
+    cJSON *body = read_body(req);
+    ESP_RETURN_ON_FALSE(body, httpd_resp_send_500(req), TAG, "bad body");
+
+    const cJSON *id = cJSON_GetObjectItemCaseSensitive(body, "id");
+    const cJSON *key = cJSON_GetObjectItemCaseSensitive(body, "key");
+    if (!cJSON_IsNumber(id) || id->valueint < 0 || id->valueint >= SALINA_SOURCE_COUNT) {
+        cJSON_Delete(body);
+        return httpd_resp_send_500(req);
+    }
+    s_pending.source = (salina_source_id_t)id->valueint;
+    strlcpy(s_pending.api_key, cJSON_IsString(key) ? key->valuestring : "", sizeof(s_pending.api_key));
+    cJSON_Delete(body);
+
+    const salina_source_t *chosen = salina_source_get(s_pending.source);
+    ESP_LOGI(TAG, "source set to %s, api key %u chars", chosen->name, (unsigned)strlen(s_pending.api_key));
+    return httpd_resp_sendstr(req, "{}");
+}
+
 static esp_err_t status_get(httpd_req_t *req)
 {
     static const char *names[] = { "idle", "connecting", "connected", "failed" };
@@ -234,8 +275,11 @@ static esp_err_t search_get(httpd_req_t *req)
              (unsigned)esp_get_free_heap_size(),
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 
+    const salina_source_t *source = salina_source_get(s_pending.source);
+    ESP_RETURN_ON_FALSE(source, httpd_resp_send_500(req), TAG, "no such source");
+
     salina_stop_info_t stop;
-    const esp_err_t err = salina_lookup_stop(value, &stop);
+    const esp_err_t err = source->lookup(&s_pending, value, &stop);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "lookup failed: %s", esp_err_to_name(err));
         return httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, esp_err_to_name(err));
@@ -249,7 +293,8 @@ static esp_err_t search_get(httpd_req_t *req)
     cJSON *list = cJSON_AddArrayToObject(json, "signs");
     for (int i = 0; i < stop.sign_count; i++) {
         cJSON *entry = cJSON_CreateObject();
-        cJSON_AddNumberToObject(entry, "number", stop.signs[i].number);
+        cJSON_AddStringToObject(entry, "selector", stop.signs[i].selector);
+        cJSON_AddStringToObject(entry, "label", stop.signs[i].label);
         cJSON_AddStringToObject(entry, "description", stop.signs[i].description);
         cJSON_AddItemToArray(list, entry);
     }
@@ -264,13 +309,13 @@ static esp_err_t save_post(httpd_req_t *req)
     const cJSON *stop = cJSON_GetObjectItemCaseSensitive(body, "stop");
     const cJSON *left = cJSON_GetObjectItemCaseSensitive(body, "left");
     const cJSON *right = cJSON_GetObjectItemCaseSensitive(body, "right");
-    if (!cJSON_IsString(stop) || !cJSON_IsNumber(left) || !cJSON_IsNumber(right)) {
+    if (!cJSON_IsString(stop) || !cJSON_IsString(left) || !cJSON_IsString(right)) {
         cJSON_Delete(body);
         return httpd_resp_send_500(req);
     }
     strlcpy(s_pending.stop, stop->valuestring, sizeof(s_pending.stop));
-    s_pending.sign_left = left->valueint;
-    s_pending.sign_right = right->valueint;
+    strlcpy(s_pending.left, left->valuestring, sizeof(s_pending.left));
+    strlcpy(s_pending.right, right->valuestring, sizeof(s_pending.right));
     cJSON_Delete(body);
 
     const esp_err_t ret = salina_config_save(&s_pending);
@@ -349,7 +394,7 @@ static esp_err_t start_server(void)
 {
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.stack_size = HTTPD_STACK;
-    cfg.max_uri_handlers = 8;
+    cfg.max_uri_handlers = 10;
     cfg.lru_purge_enable = true;
     ESP_RETURN_ON_ERROR(httpd_start(&s_httpd, &cfg), TAG, "httpd");
 
@@ -358,6 +403,8 @@ static esp_err_t start_server(void)
         { .uri = "/scan", .method = HTTP_GET, .handler = scan_get },
         { .uri = "/status", .method = HTTP_GET, .handler = status_get },
         { .uri = "/search", .method = HTTP_GET, .handler = search_get },
+        { .uri = "/sources", .method = HTTP_GET, .handler = sources_get },
+        { .uri = "/source", .method = HTTP_POST, .handler = source_post },
         { .uri = "/connect", .method = HTTP_POST, .handler = connect_post },
         { .uri = "/save", .method = HTTP_POST, .handler = save_post },
     };

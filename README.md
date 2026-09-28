@@ -1,12 +1,14 @@
 # esp_salina
 
-A public transport departure board for any stop in the Brno IDS JMK area, on a
+A public transport departure board on a
 [LaskaKit ESPink-Shelf-2.9](https://www.laskakit.cz/laskakit-espink-shelf-2-9-esp32-e-paper/)
 (ESP32 + a 2.9" GDEY029T94 e-paper panel).
 
-It wakes on a timer, joins Wi-Fi, fetches the next departures from the IDS JMK
-API, draws two platforms side by side, refreshes the panel and goes back to deep
-sleep.
+It wakes on a timer, joins Wi-Fi, fetches the next departures, draws two
+platforms side by side, refreshes the panel and goes back to deep sleep.
+
+Two networks are built in and picked during setup: **IDS JMK**, covering Brno
+and the rest of South Moravia, and **PID** for Prague, through the Golemio API.
 
 ![Departures on the panel](docs/departures.jpeg)
 
@@ -37,15 +39,25 @@ credentials and moving to another network needs no rebuild.
 
 2. Scan the QR, or join the open `esp_salina` network by hand. The setup page
    should open by itself; if it does not, go to `http://192.168.4.1`.
-3. Pick your network and enter its password. The board joins while keeping the
+3. Pick your Wi-Fi and enter its password. The board joins while keeping the
    setup network alive, so the page stays reachable - it may blink out for a
    second as the radio changes channel.
-4. Type the stop name. Case and diacritics do not matter, `kartouzska` finds
-   `Kartouzská`, and partial names work. Any IDS JMK stop will do, not just
-   Brno ones - `znojmo`, `blansko` and `kurim` all resolve. The result names
-   the town, so check it before saving. Pick a platform for each column from
-   the ones it found, and save. The board restarts and starts showing
-   departures.
+4. Choose the transport network. Prague also asks for an API key here; the
+   form says where to get one.
+5. Type the stop name, then pick a platform for each column from the ones it
+   found and save. The board restarts and starts showing departures.
+
+How forgiving the stop name is depends on which one you picked:
+
+| | Matching | Platforms | Key |
+|---|---|---|---|
+| IDS JMK | loose - `kartouzska` finds `Kartouzská`, partial names work | numbered, with a direction | none |
+| PID | **exact**, including capitals and accents | lettered (`A`, `J`) or numbered, no direction text | yours, free |
+
+For IDS JMK any stop in the area resolves, not just Brno ones - `znojmo`,
+`blansko` and `kurim` all work - and the result names the town, so check it
+before saving. PID has no fuzzy matching of any kind, so `malostranska` finds
+nothing and `Malostranská` is required.
 
 The portal stays up until you finish it, so an unprovisioned board keeps its
 radio on. Power it from USB while setting it up rather than leaving it on a
@@ -55,8 +67,14 @@ The settings live in NVS. To change them, either erase NVS over the cable or
 set `SALINA_CONFIG_PIN` to a GPIO and hold a button on it at boot. Not GPIO0 -
 low at reset puts the ESP32 into ROM download mode.
 
-Platforms only exist in the API while they have upcoming departures, so setting
-up in the middle of the night can show a stop with no platforms to choose.
+On IDS JMK a platform only exists in the API while it has upcoming departures,
+so setting up in the middle of the night can show a stop with no platforms to
+choose. The same answer turns up in short bursts at any hour; searching again
+clears it.
+
+Prague keys are per person - the Golemio terms forbid sharing one across
+devices - which is why the key is asked for during setup rather than being
+built in.
 
 ## Configuration
 
@@ -94,9 +112,20 @@ enough for their longest value, measured from the font.
 | To change | Edit |
 |---|---|
 | Board pins, panel model, orientation | `main/board.h` |
-| Data source (another city, a proxy) | `main/idsjmk.c`, filling `salina_data_t` from `main/salina.h` |
+| Add a city | a new file next to `main/pid.c` |
 | Screen layout | `main/ui.c` |
 | Sleep and retry policy | `main/main.c` |
+
+A city is one file exporting a `salina_source_t` (`main/salina.h`): a `lookup()`
+that turns a typed name into platforms for the setup form, and a `fetch()` that
+fills `salina_data_t`. Register it in `main/source.c` and it appears in the
+setup dropdown; nothing else knows which network is in use. `main/http.c` has
+the HTTPS GET, with an optional `X-Access-Token` for APIs that want a key.
+
+The two shipped sources show the range: IDS JMK numbers its platforms and
+matches names loosely, PID labels them with letters and demands exact names, so
+the column selector is stored as text - `"1"` in one case, a GTFS stop id like
+`"U360Z1P"` in the other.
 
 The display driver is a separate component,
 [`dzarda7/esp_epaper`](https://components.espressif.com/components/dzarda7/esp_epaper),

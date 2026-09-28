@@ -151,7 +151,12 @@ void app_main(void)
         enter_deep_sleep(PORTAL_RETRY_S);
     }
 
-    ESP_LOGI(TAG, "wake %" PRIu32 ", stop \"%s\"", ++s_wake_count, cfg.stop);
+    const salina_source_t *chosen = salina_source_get(cfg.source);
+    ESP_LOGI(TAG,
+             "wake %" PRIu32 ", %s, stop \"%s\"",
+             ++s_wake_count,
+             chosen ? chosen->name : "unknown source",
+             cfg.stop);
 
     salina_data_t data = { 0 };
     bool have_data = false;
@@ -163,7 +168,12 @@ void app_main(void)
             s_clock_valid = true;
             s_last_sync = time(NULL);
         }
-        have_data = (salina_fetch_departures(&cfg, &data) == ESP_OK);
+        const salina_source_t *source = salina_source_get(cfg.source);
+        if (source) {
+            have_data = (source->fetch(&cfg, &data) == ESP_OK);
+        } else {
+            ESP_LOGE(TAG, "stored source %d is not one this build has", (int)cfg.source);
+        }
     }
     salina_net_disconnect();
 

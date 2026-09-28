@@ -37,12 +37,18 @@ legend{font-size:.85rem;color:#555}
 </div>
 
 <div id="stage2">
-  <h2>2 &middot; Stop</h2>
-  <label for="stop">Stop name &mdash; any IDS JMK stop, not just Brno</label>
-  <input id="stop" placeholder="kartouzska, znojmo, blansko&hellip;" autocomplete="off">
-  <p class="hint">Accents and case do not matter and partial names work, so
-  <code>kartouzska</code> finds <code>Kartouzsk&aacute;</code>. Check the town
-  in the result before you save.</p>
+  <h2>2 &middot; Where</h2>
+  <label for="city">Network</label>
+  <select id="city"></select>
+  <div id="keywrap" style="display:none">
+    <label for="apikey">API key</label>
+    <input id="apikey" autocomplete="off" spellcheck="false">
+    <p class="hint" id="keyhint"></p>
+  </div>
+
+  <label for="stop">Stop name</label>
+  <input id="stop" autocomplete="off">
+  <p class="hint" id="stophint"></p>
   <button id="find">Find</button>
   <div id="stopmsg"></div>
   <form id="picker" style="display:none">
@@ -95,16 +101,50 @@ $('join').onclick = async () => {
   $('join').disabled = false;
 };
 
+let sources = [];
+
+fetch('/sources').then(r => r.json()).then(list => {
+  sources = list;
+  const sel = $('city');
+  sel.innerHTML = '';
+  list.forEach(s => {
+    const o = document.createElement('option');
+    o.value = s.id; o.textContent = s.name;
+    sel.appendChild(o);
+  });
+  sel.onchange = pickCity;
+  pickCity();
+});
+
+function pickCity() {
+  const s = sources.find(x => x.id == +$('city').value);
+  if (!s) { return; }
+  $('stophint').textContent = s.hint;
+  $('keywrap').style.display = s.needs_key ? 'block' : 'none';
+  $('keyhint').textContent = s.key_hint || '';
+  $('picker').style.display = 'none';
+  found = null;
+}
+
 $('find').onclick = async () => {
   const q = $('stop').value.trim();
   if (!q) { return; }
-  show($('stopmsg'), 'Searching…', 'ok');
+  show($('stopmsg'), 'Searching\u2026', 'ok');
+  await fetch('/source', {
+    method: 'POST',
+    body: JSON.stringify({id: +$('city').value, key: $('apikey').value.trim()})
+  });
   const r = await fetch('/search?q=' + encodeURIComponent(q));
-  if (!r.ok) { show($('stopmsg'), 'No stop matched.', 'err'); return; }
+  if (!r.ok) {
+    const why = await r.text();
+    show($('stopmsg'), why.indexOf('INVALID_STATE') >= 0
+         ? 'The API key was refused.' : 'No stop matched.', 'err');
+    $('picker').style.display = 'none';
+    return;
+  }
   found = await r.json();
   if (!found.signs.length) {
-    show($('stopmsg'), 'Found "' + found.full + '", but it lists no platforms right now. ' +
-         'The API hides platforms with no upcoming departures, so try again during service hours.', 'err');
+    show($('stopmsg'), 'Found "' + found.full + '", but it lists no platforms right now.', 'err');
     $('picker').style.display = 'none';
     return;
   }
@@ -112,11 +152,10 @@ $('find').onclick = async () => {
   ['left', 'right'].forEach((side, idx) => {
     $(side).innerHTML = '';
     found.signs.forEach((s, i) => {
-      const id = side + s.number;
       const row = document.createElement('label');
       row.className = 'sign';
-      row.innerHTML = '<input type="radio" name="' + side + '" value="' + s.number + '"' +
-                      (i === idx ? ' checked' : '') + '><span><b>' + s.number + '</b> ' +
+      row.innerHTML = '<input type="radio" name="' + side + '" value="' + s.selector + '"' +
+                      (i === idx ? ' checked' : '') + '><span><b>' + s.label + '</b> ' +
                       (s.description || '') + '</span>';
       $(side).appendChild(row);
     });
@@ -130,7 +169,7 @@ $('picker').onsubmit = async e => {
   const pick = side => document.querySelector('input[name=' + side + ']:checked').value;
   await fetch('/save', {
     method: 'POST',
-    body: JSON.stringify({stop: found.name, left: +pick('left'), right: +pick('right')})
+    body: JSON.stringify({stop: found.name, left: pick('left'), right: pick('right')})
   });
   document.body.innerHTML = '<h1>Saved</h1><p>The board is restarting. ' +
                             'It will show departures at the next update.</p>';

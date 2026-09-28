@@ -23,8 +23,10 @@ static const char *TAG = "config";
 #define KEY_SSID      "ssid"
 #define KEY_PASS      "pass"
 #define KEY_STOP      "stop"
-#define KEY_SIGN_L    "sign_l"
-#define KEY_SIGN_R    "sign_r"
+#define KEY_SOURCE    "source"
+#define KEY_LEFT      "left"
+#define KEY_RIGHT     "right"
+#define KEY_API_KEY   "api_key"
 
 esp_err_t salina_config_load(salina_config_t *out)
 {
@@ -52,17 +54,24 @@ esp_err_t salina_config_load(salina_config_t *out)
         goto out;
     }
 
-    int32_t left = 0;
-    int32_t right = 0;
-    ret = nvs_get_i32(nvs, KEY_SIGN_L, &left);
+    len = sizeof(out->left);
+    ret = nvs_get_str(nvs, KEY_LEFT, out->left, &len);
     if (ret == ESP_OK) {
-        ret = nvs_get_i32(nvs, KEY_SIGN_R, &right);
+        len = sizeof(out->right);
+        ret = nvs_get_str(nvs, KEY_RIGHT, out->right, &len);
     }
     if (ret != ESP_OK) {
         goto out;
     }
-    out->sign_left = left;
-    out->sign_right = right;
+
+    int32_t source = SALINA_SOURCE_IDSJMK;
+    nvs_get_i32(nvs, KEY_SOURCE, &source);
+    out->source = (source >= 0 && source < SALINA_SOURCE_COUNT) ? (salina_source_id_t)source : SALINA_SOURCE_IDSJMK;
+
+    len = sizeof(out->api_key);
+    if (nvs_get_str(nvs, KEY_API_KEY, out->api_key, &len) != ESP_OK) {
+        out->api_key[0] = '\0'; /* sources that need no key store none */
+    }
 
 out:
     nvs_close(nvs);
@@ -79,11 +88,13 @@ esp_err_t salina_config_save(const salina_config_t *cfg)
     esp_err_t ret = ESP_OK;
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_SSID, cfg->ssid), out, TAG, "write ssid");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_PASS, cfg->password), out, TAG, "write pass");
+    ESP_GOTO_ON_ERROR(nvs_set_i32(nvs, KEY_SOURCE, cfg->source), out, TAG, "write source");
     ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_STOP, cfg->stop), out, TAG, "write stop");
-    ESP_GOTO_ON_ERROR(nvs_set_i32(nvs, KEY_SIGN_L, cfg->sign_left), out, TAG, "write left");
-    ESP_GOTO_ON_ERROR(nvs_set_i32(nvs, KEY_SIGN_R, cfg->sign_right), out, TAG, "write right");
+    ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_LEFT, cfg->left), out, TAG, "write left");
+    ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_RIGHT, cfg->right), out, TAG, "write right");
+    ESP_GOTO_ON_ERROR(nvs_set_str(nvs, KEY_API_KEY, cfg->api_key), out, TAG, "write api key");
     ESP_GOTO_ON_ERROR(nvs_commit(nvs), out, TAG, "commit");
-    ESP_LOGI(TAG, "saved \"%s\", signs %d and %d", cfg->stop, cfg->sign_left, cfg->sign_right);
+    ESP_LOGI(TAG, "saved \"%s\", columns \"%s\" and \"%s\"", cfg->stop, cfg->left, cfg->right);
 
 out:
     nvs_close(nvs);
@@ -100,8 +111,10 @@ esp_err_t salina_config_erase(void)
     nvs_erase_key(nvs, KEY_SSID);
     nvs_erase_key(nvs, KEY_PASS);
     nvs_erase_key(nvs, KEY_STOP);
-    nvs_erase_key(nvs, KEY_SIGN_L);
-    nvs_erase_key(nvs, KEY_SIGN_R);
+    nvs_erase_key(nvs, KEY_SOURCE);
+    nvs_erase_key(nvs, KEY_LEFT);
+    nvs_erase_key(nvs, KEY_RIGHT);
+    nvs_erase_key(nvs, KEY_API_KEY);
     ret = nvs_commit(nvs);
     nvs_close(nvs);
     return ret;

@@ -34,6 +34,7 @@
 #include "freertos/task.h"
 #include "lvgl.h"
 #include "salina.h"
+#include "salina_config.h"
 
 static const char *TAG = "ui";
 

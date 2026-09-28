@@ -2,18 +2,15 @@
  * SPDX-FileCopyrightText: 2026 Jaroslav Burian
  * SPDX-License-Identifier: MIT
  *
- * IDS JMK departures API.
+ * IDS JMK: Brno and the rest of the South Moravian network.
  *
- * GET https://www.idsjmk.cz/api/departures/busstop-by-name?busStopName=<stop>
+ * GET /api/departures/busstop-by-name?busStopName=<stop>
  *
- * The response is small (under 2 kB for a tram stop), so it is buffered whole
- * and handed to cJSON. Interesting bits:
- *   stops[0].stop.chapsName          - the stop name
- *   stops[0].signs[n].busStopSign.number - platform number, selects a column
- *   stops[0].signs[n].departures[]   - link, destinationStop, time, isOnline
- *
- * Times arrive either as "7min" or as "16:03", optionally prefixed with U+267F
- * (the wheelchair symbol) for a low-floor vehicle, which is stripped here.
+ * The API matches loosely - case, diacritics and partial names all work - and
+ * answers with a single best match rather than a list. Platforms are numbered,
+ * and a platform with nothing due is omitted entirely, so an empty sign list
+ * means "nothing soon" and not "no such platform". Times arrive either as
+ * "7min" or as "16:03", optionally prefixed with the wheelchair symbol.
  */
 #include <ctype.h>
 #include <stdlib.h>
@@ -22,70 +19,19 @@
 
 #include "cJSON.h"
 #include "esp_check.h"
-#include "esp_crt_bundle.h"
-#include "esp_http_client.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "salina.h"
 #include "salina_config.h"
+#include "salina_http.h"
 
 static const char *TAG = "idsjmk";
 
-#define API_HOST       "www.idsjmk.cz"
-#define API_PATH       "/api/departures/busstop-by-name?busStopName="
-#define API_IDS_PATH   "/api/departures/busstops"
-#define RESPONSE_LIMIT 8192
+#define API_HOST "www.idsjmk.cz"
+#define API_PATH "/api/departures/busstop-by-name?busStopName="
 
-typedef struct {
-    char *buf;
-    size_t len;
-} response_t;
-
-/** @brief Percent-encode everything that is not an unreserved URL character. */
-static void url_encode(const char *in, char *out, size_t out_size)
-{
-    static const char hex[] = "0123456789ABCDEF";
-    size_t o = 0;
-
-    for (const unsigned char *p = (const unsigned char *)in; *p && o + 4 < out_size; p++) {
-        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
-            out[o++] = (char)*p;
-        } else {
-            out[o++] = '%';
-            out[o++] = hex[*p >> 4];
-            out[o++] = hex[*p & 0x0F];
-        }
-    }
-    out[o] = '\0';
-}
-
-static esp_err_t http_event(esp_http_client_event_t *evt)
-{
-    response_t *resp = (response_t *)evt->user_data;
-
-    if (evt->event_id != HTTP_EVENT_ON_DATA || !resp) {
-        return ESP_OK;
-    }
-    if (resp->len + evt->data_len >= RESPONSE_LIMIT) {
-        ESP_LOGE(TAG, "response larger than %d bytes", RESPONSE_LIMIT);
-        return ESP_FAIL;
-    }
-    memcpy(resp->buf + resp->len, evt->data, evt->data_len);
-    resp->len += evt->data_len;
-    resp->buf[resp->len] = '\0';
-    return ESP_OK;
-}
-
-/**
- * @brief Turn an API time string into the wall clock time of the departure.
- *
- * The API answers either "16:03", which is already what we want, or a countdown
- * like "7min", which is only true at the moment of the request - by the time the
- * panel refreshes again it is stale. Countdowns are therefore converted to the
- * absolute time the vehicle is expected. Both forms may carry a leading U+267F
- * (wheelchair) marking a low-floor vehicle, which is dropped.
- */
+/** @brief True once the clock holds a real date rather than 1970. */
 static void format_time(const char *in, char *out, size_t out_size)
 {
     /* Skip anything before the first digit: that is the wheelchair glyph. */
@@ -99,13 +45,13 @@ static void format_time(const char *in, char *out, size_t out_size)
         return;
     }
 
+    /* A countdown is only true at the moment of the request; by the next
+     * refresh it is stale, so it becomes the time the vehicle is expected. */
     const int minutes = atoi(in);
     if (!salina_clock_is_set()) {
-        /* No synced clock, so an absolute time would be a lie. */
         snprintf(out, out_size, "%d'", minutes);
         return;
     }
-
     const time_t departure = time(NULL) + (time_t)minutes * 60;
     struct tm tm_departure;
     localtime_r(&departure, &tm_departure);
@@ -114,11 +60,10 @@ static void format_time(const char *in, char *out, size_t out_size)
 
 static void parse_sign(const cJSON *sign, salina_column_t *col)
 {
-    const cJSON *departures = cJSON_GetObjectItemCaseSensitive(sign, "departures");
     const cJSON *departure = NULL;
 
     col->count = 0;
-    cJSON_ArrayForEach(departure, departures)
+    cJSON_ArrayForEach(departure, cJSON_GetObjectItemCaseSensitive(sign, "departures"))
     {
         if (col->count >= SALINA_MAX_DEPARTURES) {
             break;
@@ -130,7 +75,6 @@ static void parse_sign(const cJSON *sign, salina_column_t *col)
         if (!cJSON_IsString(link) || !cJSON_IsString(dest) || !cJSON_IsString(time)) {
             continue;
         }
-
         salina_departure_t *d = &col->departures[col->count++];
         strlcpy(d->line, link->valuestring, sizeof(d->line));
         strlcpy(d->destination, dest->valuestring, sizeof(d->destination));
@@ -139,42 +83,54 @@ static void parse_sign(const cJSON *sign, salina_column_t *col)
     }
 }
 
-static esp_err_t parse_response(const char *json, const salina_config_t *cfg, salina_data_t *out)
+/** @brief Build the request path for a stop name. */
+static void stop_path(const char *stop, char *path, size_t path_size)
+{
+    char encoded[128];
+
+    salina_url_encode(stop, encoded, sizeof(encoded));
+    snprintf(path, path_size, "%s%s", API_PATH, encoded);
+}
+
+/** @brief The first stop of a reply, or NULL. */
+static const cJSON *first_stop(const cJSON *root)
+{
+    return cJSON_GetArrayItem(cJSON_GetObjectItemCaseSensitive(root, "stops"), 0);
+}
+
+static esp_err_t parse_departures(const char *json, const salina_config_t *cfg, salina_data_t *out)
 {
     cJSON *root = cJSON_Parse(json);
     ESP_RETURN_ON_FALSE(root, ESP_ERR_INVALID_RESPONSE, TAG, "malformed JSON");
 
     esp_err_t ret = ESP_ERR_NOT_FOUND;
-    const cJSON *stops = cJSON_GetObjectItemCaseSensitive(root, "stops");
-    const cJSON *stop_entry = cJSON_GetArrayItem(stops, 0);
-    if (!stop_entry) {
+    const cJSON *entry = first_stop(root);
+    if (!entry) {
         ESP_LOGE(TAG, "no stop named \"%s\"", cfg->stop);
         goto out;
     }
 
-    const cJSON *stop = cJSON_GetObjectItemCaseSensitive(stop_entry, "stop");
+    const cJSON *stop = cJSON_GetObjectItemCaseSensitive(entry, "stop");
     const cJSON *name = cJSON_GetObjectItemCaseSensitive(stop, "chapsName");
     strlcpy(out->stop_name, cJSON_IsString(name) ? name->valuestring : cfg->stop, sizeof(out->stop_name));
 
-    const int wanted[SALINA_COLUMNS] = { cfg->sign_left, cfg->sign_right };
-    const cJSON *signs = cJSON_GetObjectItemCaseSensitive(stop_entry, "signs");
-
+    const char *wanted[SALINA_COLUMNS] = { cfg->left, cfg->right };
     for (int i = 0; i < SALINA_COLUMNS; i++) {
-        out->columns[i].sign_number = wanted[i];
+        strlcpy(out->columns[i].label, wanted[i], sizeof(out->columns[i].label));
         out->columns[i].count = 0;
 
         const cJSON *sign = NULL;
-        cJSON_ArrayForEach(sign, signs)
+        cJSON_ArrayForEach(sign, cJSON_GetObjectItemCaseSensitive(entry, "signs"))
         {
             const cJSON *info = cJSON_GetObjectItemCaseSensitive(sign, "busStopSign");
             const cJSON *number = cJSON_GetObjectItemCaseSensitive(info, "number");
-            if (cJSON_IsNumber(number) && number->valueint == wanted[i]) {
+            if (cJSON_IsNumber(number) && number->valueint == atoi(wanted[i])) {
                 parse_sign(sign, &out->columns[i]);
                 break;
             }
         }
         if (out->columns[i].count == 0) {
-            ESP_LOGW(TAG, "sign %d has no departures", wanted[i]);
+            ESP_LOGW(TAG, "platform %s has no departures", wanted[i]);
         }
     }
     /* The API sometimes answers with the stop but no platforms at all. That is
@@ -186,97 +142,15 @@ out:
     return ret;
 }
 
-/**
- * @brief Perform one API request into a caller-provided buffer.
- *
- * @param[in]  path     Request path, query string included
- * @param[in]  body     JSON body for a POST, or NULL for a GET
- * @param[out] resp     Receives the response text
- */
-static esp_err_t api_request(const char *path, const char *body, response_t *resp)
-{
-    const esp_http_client_config_t cfg = {
-        .host = API_HOST,
-        .path = path,
-        .transport_type = HTTP_TRANSPORT_OVER_SSL,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .event_handler = http_event,
-        .user_data = resp,
-        .method = body ? HTTP_METHOD_POST : HTTP_METHOD_GET,
-        .timeout_ms = 10000,
-    };
-    esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    ESP_RETURN_ON_FALSE(client, ESP_FAIL, TAG, "client init");
-
-    if (body) {
-        esp_http_client_set_header(client, "Content-Type", "application/json");
-        esp_http_client_set_post_field(client, body, strlen(body));
-    }
-
-    esp_err_t ret = esp_http_client_perform(client);
-    if (ret == ESP_OK) {
-        const int status = esp_http_client_get_status_code(client);
-        if (status != 200) {
-            ESP_LOGE(TAG, "HTTP %d", status);
-            ret = ESP_ERR_INVALID_RESPONSE;
-        }
-    } else {
-        ESP_LOGE(TAG, "request failed: %s", esp_err_to_name(ret));
-    }
-    esp_http_client_cleanup(client);
-    return ret;
-}
-
-esp_err_t salina_fetch_departures(const salina_config_t *cfg, salina_data_t *out)
-{
-    ESP_RETURN_ON_FALSE(cfg && out, ESP_ERR_INVALID_ARG, TAG, "null argument");
-
-    char encoded[128];
-    url_encode(cfg->stop, encoded, sizeof(encoded));
-
-    char path[sizeof(API_PATH) + sizeof(encoded)];
-    snprintf(path, sizeof(path), "%s%s", API_PATH, encoded);
-
-    response_t resp = { .buf = malloc(RESPONSE_LIMIT), .len = 0 };
-    ESP_RETURN_ON_FALSE(resp.buf, ESP_ERR_NO_MEM, TAG, "no mem for response");
-
-    esp_err_t ret = ESP_FAIL;
-    for (int attempt = 1; attempt <= CONFIG_SALINA_FETCH_ATTEMPTS; attempt++) {
-        resp.len = 0;
-        resp.buf[0] = '\0';
-
-        ret = api_request(path, NULL, &resp);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "got %u bytes", (unsigned)resp.len);
-            ret = parse_response(resp.buf, cfg, out);
-        }
-        if (ret == ESP_OK || attempt == CONFIG_SALINA_FETCH_ATTEMPTS) {
-            break;
-        }
-
-        ESP_LOGW(TAG,
-                 "attempt %d/%d failed, retrying in %d s",
-                 attempt,
-                 CONFIG_SALINA_FETCH_ATTEMPTS,
-                 CONFIG_SALINA_FETCH_RETRY_DELAY_S);
-        vTaskDelay(pdMS_TO_TICKS(CONFIG_SALINA_FETCH_RETRY_DELAY_S * 1000));
-    }
-
-    free(resp.buf);
-    return ret;
-}
-
-/** @brief Pull the stop, its town-qualified name and its platforms out of a reply. */
 static esp_err_t parse_stop_info(const char *json, const char *query, salina_stop_info_t *out)
 {
     cJSON *root = cJSON_Parse(json);
     ESP_RETURN_ON_FALSE(root, ESP_ERR_INVALID_RESPONSE, TAG, "malformed JSON");
 
     esp_err_t ret = ESP_ERR_NOT_FOUND;
-    const cJSON *stops = cJSON_GetObjectItemCaseSensitive(root, "stops");
-    const cJSON *entry = cJSON_GetArrayItem(stops, 0);
+    const cJSON *entry = first_stop(root);
     if (!entry) {
-        goto out_free;
+        goto out;
     }
 
     const cJSON *stop = cJSON_GetObjectItemCaseSensitive(entry, "stop");
@@ -298,47 +172,72 @@ static esp_err_t parse_stop_info(const char *json, const char *query, salina_sto
             continue;
         }
         salina_sign_t *slot = &out->signs[out->sign_count++];
-        slot->number = number->valueint;
+        snprintf(slot->selector, sizeof(slot->selector), "%d", number->valueint);
+        strlcpy(slot->label, slot->selector, sizeof(slot->label));
         strlcpy(slot->description, cJSON_IsString(desc) ? desc->valuestring : "", sizeof(slot->description));
     }
     ret = ESP_OK;
 
-out_free:
+out:
     cJSON_Delete(root);
     return ret;
 }
 
-esp_err_t salina_lookup_stop(const char *query, salina_stop_info_t *out)
+static esp_err_t idsjmk_fetch(const salina_config_t *cfg, salina_data_t *out)
 {
+    ESP_RETURN_ON_FALSE(cfg && out, ESP_ERR_INVALID_ARG, TAG, "null argument");
+
+    char path[256];
+    stop_path(cfg->stop, path, sizeof(path));
+
+    char *body = malloc(SALINA_RESPONSE_LIMIT);
+    ESP_RETURN_ON_FALSE(body, ESP_ERR_NO_MEM, TAG, "no mem for response");
+
+    esp_err_t ret = ESP_FAIL;
+    for (int attempt = 1; attempt <= CONFIG_SALINA_FETCH_ATTEMPTS; attempt++) {
+        ret = salina_http_get(API_HOST, path, NULL, body, SALINA_RESPONSE_LIMIT);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "got %u bytes", (unsigned)strlen(body));
+            ret = parse_departures(body, cfg, out);
+        }
+        if (ret == ESP_OK || attempt == CONFIG_SALINA_FETCH_ATTEMPTS) {
+            break;
+        }
+        ESP_LOGW(TAG,
+                 "attempt %d/%d failed, retrying in %d s",
+                 attempt,
+                 CONFIG_SALINA_FETCH_ATTEMPTS,
+                 CONFIG_SALINA_FETCH_RETRY_DELAY_S);
+        vTaskDelay(pdMS_TO_TICKS(CONFIG_SALINA_FETCH_RETRY_DELAY_S * 1000));
+    }
+
+    free(body);
+    return ret;
+}
+
+static esp_err_t idsjmk_lookup(const salina_config_t *cfg, const char *query, salina_stop_info_t *out)
+{
+    (void)cfg;
     ESP_RETURN_ON_FALSE(query && out, ESP_ERR_INVALID_ARG, TAG, "null argument");
 
-    char encoded[128];
-    url_encode(query, encoded, sizeof(encoded));
+    char path[256];
+    stop_path(query, path, sizeof(path));
 
-    char path[sizeof(API_PATH) + sizeof(encoded)];
-    snprintf(path, sizeof(path), "%s%s", API_PATH, encoded);
+    char *body = malloc(SALINA_RESPONSE_LIMIT);
+    ESP_RETURN_ON_FALSE(body, ESP_ERR_NO_MEM, TAG, "no mem for response");
 
-    response_t resp = { .buf = malloc(RESPONSE_LIMIT), .len = 0 };
-    ESP_RETURN_ON_FALSE(resp.buf, ESP_ERR_NO_MEM, TAG, "no mem for response");
-
-    /* The same intermittently empty answer the departure fetch retries around
-     * also lands here, and during setup it is worse: it reads as "this stop has
-     * no platforms", which is indistinguishable from a stop that really has
-     * none. Retry before believing it. */
+    /* An empty platform list here reads as "this stop has no platforms", which
+     * is indistinguishable from the intermittently empty answer, so retry. */
     esp_err_t ret = ESP_FAIL;
     for (int attempt = 1; attempt <= CONFIG_SALINA_FETCH_ATTEMPTS; attempt++) {
         memset(out, 0, sizeof(*out));
-        resp.len = 0;
-        resp.buf[0] = '\0';
-
-        ret = api_request(path, NULL, &resp);
+        ret = salina_http_get(API_HOST, path, NULL, body, SALINA_RESPONSE_LIMIT);
         if (ret == ESP_OK) {
-            ret = parse_stop_info(resp.buf, query, out);
+            ret = parse_stop_info(body, query, out);
         }
         if ((ret == ESP_OK && out->sign_count > 0) || attempt == CONFIG_SALINA_FETCH_ATTEMPTS) {
             break;
         }
-
         ESP_LOGW(TAG,
                  "attempt %d/%d gave no platforms, retrying in %d s",
                  attempt,
@@ -347,6 +246,15 @@ esp_err_t salina_lookup_stop(const char *query, salina_stop_info_t *out)
         vTaskDelay(pdMS_TO_TICKS(CONFIG_SALINA_FETCH_RETRY_DELAY_S * 1000));
     }
 
-    free(resp.buf);
+    free(body);
     return ret;
 }
+
+const salina_source_t salina_source_idsjmk = {
+    .name = "Brno and South Moravia (IDS JMK)",
+    .hint = "Accents and case do not matter and partial names work, so "
+            "\"kartouzska\" finds \"Kartouzska\".",
+    .needs_api_key = false,
+    .lookup = idsjmk_lookup,
+    .fetch = idsjmk_fetch,
+};
