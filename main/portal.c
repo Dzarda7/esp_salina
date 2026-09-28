@@ -168,9 +168,18 @@ static esp_err_t connect_post(httpd_req_t *req)
     strlcpy(s_pending.password, cJSON_IsString(pass) ? pass->valuestring : "", sizeof(s_pending.password));
     cJSON_Delete(body);
 
+    /* A second attempt arrives with the station still associated from the
+     * first, and esp_wifi_connect() refuses that outright, so nothing would
+     * happen until the deadline reported a failure. Drop the link first; the
+     * error when there was nothing to drop is not interesting. */
+    esp_wifi_disconnect();
+
     wifi_config_t sta = { 0 };
     strlcpy((char *)sta.sta.ssid, s_pending.ssid, sizeof(sta.sta.ssid));
     strlcpy((char *)sta.sta.password, s_pending.password, sizeof(sta.sta.password));
+    /* Same minimum as the departure path: anything above WPA2 would refuse a
+     * plain WPA2-PSK access point. */
+    sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
     esp_wifi_set_config(WIFI_IF_STA, &sta);
 
     s_state = STATE_CONNECTING;
